@@ -1,0 +1,67 @@
+#include <HardwareSerial.h>
+
+// Define the custom pins for the ESP32-S3 Serial1 interface
+#define TF02_RX_PIN 18  // Connects to TF02-Pro White (TX) wire
+#define TF02_TX_PIN 17  // Connects to TF02-Pro Green (RX) wire
+
+// Create instance for the LiDAR serial interface
+HardwareSerial tfSerial(1); 
+
+// Variables to store parsed data
+uint16_t distance = 0;   // Distance in cm
+uint16_t strength = 0;   // Signal strength (indicates reliability)
+
+void setup() {
+  // Initialize USB serial communication for the Serial Monitor
+  Serial.begin(115200);
+  while (!Serial) {
+    ; // Wait for serial port to connect (needed for native USB on ESP32-S3)
+  }
+  Serial.println("ESP32-S3 TF02-Pro LiDAR Reader Starting...");
+
+  // Initialize hardware serial for TF02-Pro (115200 baud, 8N1, custom RX/TX pins)
+  tfSerial.begin(115200, SERIAL_8N1, TF02_RX_PIN, TF02_TX_PIN);
+}
+
+void loop() {
+  // Check if there are at least 9 bytes (the size of a full TF02-Pro data packet) available
+  if (tfSerial.available() >= 9) {
+    
+    // Look for the standard 2-byte header sequence: 0x59 0x59
+    if (tfSerial.read() == 0x59) {
+      if (tfSerial.read() == 0x59) {
+        
+        uint8_t packet[7];
+        // Read the remaining 7 bytes of the data frame
+        tfSerial.readBytes(packet, 7);
+        
+        // Calculate the checksum locally to verify data integrity
+        uint8_t checksum = 0x59 + 0x59;
+        for (int i = 0; i < 6; i++) {
+          checksum += packet[i];
+        }
+        
+        // Verify if our calculated checksum matches the final byte received
+        if (checksum == packet[6]) {
+          
+          // Parse Distance (Bytes 2 and 3) -> Low byte first
+          distance = packet[0] | (packet[1] << 8);
+          
+          // Parse Signal Strength (Bytes 4 and 5) -> Low byte first
+          strength = packet[2] | (packet[3] << 8);
+          
+          // Print the formatted results to the Serial Monitor
+          Serial.print("Distance: ");
+          Serial.print(distance);
+          Serial.print(" cm\t");
+          
+          Serial.print("Strength: ");
+          Serial.println(strength);
+          
+        } else {
+          Serial.println("Warning: Checksum Error!");
+        }
+      }
+    }
+  }
+}
