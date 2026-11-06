@@ -592,13 +592,7 @@
         <div class=form-group>
           <span class="grey-text font-weight-light">Units</span>
           <div>
-            <input type="radio" name="units" id="unitsCm" value="cm" checked>
-            <label for="unitsCm" class="inline-check-label"> cm</label>
-            &nbsp;&nbsp;
-            <input type="radio" name="units" id="unitsIn" value="in">
-            <label for="unitsIn" class="inline-check-label"> inch</label>
-            &nbsp;&nbsp;
-            <input type="radio" name="units" id="unitsM" value="m">
+            <input type="radio" name="units" id="unitsM" value="m" checked>
             <label for="unitsM" class="inline-check-label"> m</label>
             &nbsp;&nbsp;
             <input type="radio" name="units" id="unitsFt" value="ft">
@@ -608,7 +602,7 @@
         <div class=form-group>
           <div class=row>
             <div class="col-md-12">
-              <span class="grey-text font-weight-light">Distance Offset (<span id="offsetUnits">cm</span>)</span>
+              <span class="grey-text font-weight-light">Distance Offset (<span id="offsetUnits">m</span>)</span>
               <p class="helper-text">(+/- offset to account for sensor mounting height)</p>
               <input type="number" step="any" id="distanceOffset" class="form-control" placeholder="0.0" value="">
             </div>
@@ -645,7 +639,7 @@
   <script type="text/javascript">
     var mainResponse = {};
     const unitMillimeters = { cm: 10, in: 25.4, m: 1000, ft: 304.8 };
-    let selectedUnits = 'cm';
+    let selectedUnits = 'm';
 
     // Vanilla JS helpers
     const $ = (sel) => document.querySelector(sel);
@@ -731,11 +725,11 @@
 
     function getUnits() {
       const el = $('input[name="units"]:checked');
-      return el ? el.value : 'cm';
+      return el ? el.value : 'm';
     }
 
     function setUnits(units) {
-      if (!Object.prototype.hasOwnProperty.call(unitMillimeters, units)) units = 'cm';
+      if (units !== 'm' && units !== 'ft') units = 'm';
       const el = $(`input[name="units"][value="${units}"]`);
       if (el) el.checked = true;
       selectedUnits = units;

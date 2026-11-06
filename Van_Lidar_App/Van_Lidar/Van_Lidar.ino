@@ -1,8 +1,9 @@
 /*******************************************************************************************
  Van Lidar
 
-    ESP32 application to read distance sensor data from a Benewake TF02 Pro Lidar rangefinder
-    and transmit those reading using the ESP-NOW protocol to a ESP32 receiver app.
+    ESP32 application to read distance sensor data from one or two Benewake TF02 Pro Lidar
+    rangefinder(s) and transmit those readings using the ESP-NOW protocol to an
+    ESP32 receiver app.
 
     The /setup page allows configuration of the Access Point, sensor calibration, and
     firmware updates.  Default AP credentials are located in the LittleFS data folder at
@@ -32,7 +33,7 @@
       see the .littlefs.bin file location.  Probably in "C:\Users\<username>\AppData\Local\Temp\".
 
 *******************************************************************************************/
-const char* VERSION = "1.0.0";
+const char* VERSION = "1.0.0a";
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -75,25 +76,26 @@ float distanceOffset = 0.0f;  // offset in the selected units to account for sen
 // Timer variables
 unsigned long bootStart = 0;  // if non-zero, will restart when bootStart + bootDelay = now
 const unsigned long bootDelay = 5000;
-unsigned long lastWebTime = 0;      // sensor data webpage push
+unsigned long lastPushTime = 0;      // sensor data ESP-Now push
 const unsigned long ESPDelay = 100;
 
 // Webserver pieces
 AsyncWebServer server(80);
 AsyncEventSource events("/events");
 
-// The AP stays up at all times so setup is always reachable.
+// Three available sensor zones in Van Level app.
+// sensor 2 is front cone, sensor 3 is rear cone
+const uint8_t SENSOR_COUNT = 2;
+const uint8_t SENSOR_IDS[SENSOR_COUNT] = {2, 3};
 
 // Benewake TF02 Pro Lidar Sensor
 const uint8_t HEADER_BYTE = 0x59;
-const uint8_t SENSOR_COUNT = 2;
-const uint8_t SENSOR_IDS[SENSOR_COUNT] = {2, 3};
-const uint16_t LIDAR_CLEAR_CM = 4500;
+const uint16_t LIDAR_CLEAR_CM = 4500;  // TF02 reports 4500 when no reflected signal is detected
 #define SENSOR_TIMEOUT_MS 10000UL
-#define RX1_PIN D7  // Green Wire
-#define TX1_PIN D6  // White Wire
-#define RX2_PIN D8  // Green Wire
-#define TX2_PIN D5  // White Wire
+#define RX1_PIN D7  // Xiao ESP32S3 pin / Green Wire TF02Pro
+#define TX1_PIN D6  // Xiao ESP32S3 pin / White Wire TF02Pro
+#define RX2_PIN D8  // Xiao ESP32S3 pin / Green Wire TF02Pro
+#define TX2_PIN D5  // Xiao ESP32S3 pin / White Wire TF02Pro
 
 // ESP-NOW configuration
 enum DistanceUnits : uint8_t {
@@ -103,15 +105,15 @@ enum DistanceUnits : uint8_t {
   UNITS_FT = 3
 };
 
-const char* DISTANCE_UNIT_NAMES[] = {"cm", "in", "m", "ft"};
-const float MILLIMETERS_PER_UNIT[] = {10.0f, 25.4f, 1000.0f, 304.8f};
-uint8_t distanceUnits = UNITS_CM;
-
 typedef struct {
   uint8_t id;
   uint8_t units;    // DistanceUnits
   int16_t distance; // tenths of the selected unit (e.g. 1234 = 123.4)
 } EspNowMessage;
+
+const char* DISTANCE_UNIT_NAMES[] = {"cm", "in", "m", "ft"};
+const float MILLIMETERS_PER_UNIT[] = {10.0f, 25.4f, 1000.0f, 304.8f};
+uint8_t distanceUnits = UNITS_M;
 
 uint8_t receiverMacAddress[6] = {0, 0, 0, 0, 0, 0};
 String receiverMacStr = "";
@@ -123,6 +125,7 @@ uint8_t wifiChannel = 1;
 volatile bool lastSendSuccess = false;
 unsigned long lastSendTime = 0;
 
+// Latest sensor reading for each Lidar sensor
 struct LidarSensorState {
   uint8_t frame[9] = {};
   size_t frameLength = 0;
@@ -133,10 +136,23 @@ struct LidarSensorState {
 LidarSensorState lidarSensors[SENSOR_COUNT];
 uint8_t nextSensor = 0;
 
+// Read the latest distance data from the serial interface
+// Process everyting in the serial buffer returning only the most recent reading
+//   Each measurement frame consists of 9 bytes:
+//     • Byte 0 (0x59): Header/Start byte.
+//     • Byte 1 (0x59): Header/Start byte.
+//     • Byte 2 (High Byte): Upper 8 bits of the distance value.
+//     • Byte 3 (Low Byte): Lower 8 bits of the distance value.
+//     • Byte 4 (High Byte): Upper 8 bits of the signal strength.
+//     • Byte 5 (Low Byte): Lower 8 bits of the signal strength.
+//     • Byte 6 (Temperature High Byte)
+//     • Byte 7 (Temperature Low Byte)
+//     • Byte 8 (Checksum): (Byte 0 + Byte 1 + ... + Byte 7) & 0x00FF.
 bool updateSensorData(HardwareSerial &serial, LidarSensorState &sensor) {
   bool received = false;
 
   while (serial.available() > 0) {
+    // grab the first full frame
     uint8_t nextByte = (uint8_t)serial.read();
     if (sensor.frameLength == 0 && nextByte != HEADER_BYTE) continue;
     sensor.frame[sensor.frameLength++] = nextByte;
@@ -146,6 +162,7 @@ bool updateSensorData(HardwareSerial &serial, LidarSensorState &sensor) {
     for (size_t index = 0; index < sizeof(sensor.frame) - 1; ++index) {
       checksum = (uint8_t)(checksum + sensor.frame[index]);
     }
+    // if valid frame save the data
     if (sensor.frame[0] == HEADER_BYTE && sensor.frame[1] == HEADER_BYTE && checksum == sensor.frame[8]) {
       uint16_t distance = sensor.frame[2] | (sensor.frame[3] << 8);
       uint16_t strength = sensor.frame[4] | (sensor.frame[5] << 8);
@@ -163,6 +180,7 @@ bool updateSensorData(HardwareSerial &serial, LidarSensorState &sensor) {
   return received;
 }
 
+// Construct an ESP-NOW message containing the latest distance reading for the given sensor
 EspNowMessage getDistanceMessage(uint8_t sensorId, const LidarSensorState &sensor) {
   EspNowMessage message;
   message.id = sensorId;
@@ -250,7 +268,7 @@ bool parseMacAddress(const String &macStr, uint8_t *mac) {
 // Initialize ESP-NOW
 void initEspNow() {
   WiFi.mode(WIFI_AP);
-  WiFi.setSleep(false);
+  WiFi.setSleep(false);  // energy saving causes problems with ESP-Now messages
   
   if (esp_now_init() != ESP_OK) {
     DBG_PRINTLN("ESP-NOW initialization failed");
@@ -355,8 +373,8 @@ void setup() {
   }
 
   distanceOffset = preferences.getFloat("distanceOffset", distanceOffset);
-  distanceUnits = preferences.getUChar("distanceUnits", preferences.getBool("useInches", false) ? UNITS_INCH : UNITS_CM);
-  if (distanceUnits > UNITS_FT) distanceUnits = UNITS_CM;
+  distanceUnits = preferences.getUChar("distanceUnits", UNITS_M);
+  if (distanceUnits != UNITS_M && distanceUnits != UNITS_FT) distanceUnits = UNITS_M;
   
   DBG_PRINT("Retrieved Distance Offset: ");
   DBG_PRINT(distanceOffset);
@@ -429,10 +447,14 @@ void setup() {
   // Initialize ESP-NOW for distance data transmission
   initEspNow();
 
-  // HTML+JS+CSS+Images server callbacks
+  // HTML+Images server callbacks
   // handlers are evaluated in the order they are attached to the server.
   server.onNotFound([](AsyncWebServerRequest * request) {
     request -> send(404, "text/html", "<h1 align=\"center\">Oops! It's not here.</h1>");
+  });
+
+  server.on("/", WebRequestMethod::HTTP_GET, [](AsyncWebServerRequest * request) {
+    request -> redirect("/setup");
   });
 
   server.on("/setup", WebRequestMethod::HTTP_GET, [](AsyncWebServerRequest * request) {
@@ -568,10 +590,10 @@ void setup() {
       request -> send(400, "text/plain", "missing parameter");
       return;
     }
-    uint8_t newUnits = UNITS_CM;
+    uint8_t newUnits = UNITS_M;
     while (newUnits <= UNITS_FT && sUnits != DISTANCE_UNIT_NAMES[newUnits]) ++newUnits;
     if (newUnits > UNITS_FT) {
-      request -> send(400, "text/plain", "Units must be cm, in, m or ft.");
+      request -> send(400, "text/plain", "Units must be m or ft.");
       return;
     }
 
@@ -620,8 +642,7 @@ void setup() {
 
   // only these folders are public; APconfig.json and the HTML pages are not served from here
   server.serveStatic("/images", LittleFS, "/images");
-  server.serveStatic("/js", LittleFS, "/js");
-
+  
   // setup our WiFi for AP mode only
   WiFi.mode(WIFI_AP);
 
@@ -647,8 +668,8 @@ void loop() {
   updateSensorData(Serial1, lidarSensors[0]);
   updateSensorData(Serial2, lidarSensors[1]);
   
-  if ((millis() - lastWebTime) >= ESPDelay / SENSOR_COUNT) {
-    lastWebTime = millis();
+  if ((millis() - lastPushTime) >= ESPDelay / SENSOR_COUNT) {
+    lastPushTime = millis();
     
     if (receiverMacStr.length() > 0) {
       EspNowMessage msg = getDistanceMessage(SENSOR_IDS[nextSensor], lidarSensors[nextSensor]);

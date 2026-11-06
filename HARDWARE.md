@@ -1,11 +1,9 @@
 # Hardware
 
 ## Off the Shelf Hardware
-- **Board:** [Adafruit ESP32 Huzzah Breakout](https://www.adafruit.com/product/4172)
-- **IMU:**  Basic I2C 3-axis accelerometer.  Devices below have been verified to work
-    - **MPU-6050:** [Adafruit MPU-6050 6-DoF Accel and Gyro Sensor - STEMMA QT Qwiic](https://www.adafruit.com/product/3886)
-    - **ADXL343:** [ADXL343 - Triple-Axis Accelerometer - STEMMA QT / Qwiic](https://www.adafruit.com/product/4097)
-    - **MSA311:** [Adafruit MSA311 Triple Axis Accelerometer - STEMMA QT / Qwiic](https://www.adafruit.com/product/5309)
+- **Board:** [Seeed Studio XIAO ESP32-S3](https://www.digikey.com/en/products/detail/seeed-technology-co-ltd/102010573/24814471)
+- **Rangefinder:**
+    - **TF02-Pro:** [Benewake 40m IP65 LiDAR UART](https://www.mouser.com/en/ProductDetail/Benewake/TF02-Pro-Uart)
 - **Miscellaneous Components:**
     - **DC-DC Converter:** [Recom R-78E3.3-0.5](https://www.digikey.com/en/products/detail/recom-power/R-78E3-3-0-5/3593412) 
     - **Phoenix Wire Connector:** [Phoenix Mini Combicon MC 1840366](https://www.digikey.com/en/products/detail/phoenix-contact/1840366/349178) 
