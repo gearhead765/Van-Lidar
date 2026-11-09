@@ -92,10 +92,10 @@ const uint8_t SENSOR_IDS[SENSOR_COUNT] = {2, 3};
 const uint8_t HEADER_BYTE = 0x59;
 const uint16_t LIDAR_CLEAR_CM = 4500;  // TF02 reports 4500 when no reflected signal is detected
 #define SENSOR_TIMEOUT_MS 10000UL
-#define RX1_PIN D7  // Xiao ESP32S3 pin / Green Wire TF02Pro
+#define RX1_PIN D5  // Xiao ESP32S3 pin / Green Wire TF02Pro
 #define TX1_PIN D6  // Xiao ESP32S3 pin / White Wire TF02Pro
 #define RX2_PIN D8  // Xiao ESP32S3 pin / Green Wire TF02Pro
-#define TX2_PIN D5  // Xiao ESP32S3 pin / White Wire TF02Pro
+#define TX2_PIN D7  // Xiao ESP32S3 pin / White Wire TF02Pro
 
 // ESP-NOW configuration
 enum DistanceUnits : uint8_t {
