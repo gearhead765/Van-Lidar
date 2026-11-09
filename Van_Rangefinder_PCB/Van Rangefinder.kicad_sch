@@ -2144,7 +2144,7 @@
 		(at 146.05 55.88)
 		(diameter 0)
 		(color 0 0 0 0)
-		(uuid "32e0a3a4-9296-43c5-9dd1-f6f4d9bea955")
+		(uuid "2e9c5d13-1988-41e7-94cf-ce7a5c7078c9")
 	)
 	(junction
 		(at 167.64 120.65)
@@ -2220,16 +2220,6 @@
 	)
 	(wire
 		(pts
-			(xy 168.91 55.88) (xy 175.26 55.88)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "0b3a8ab4-fed7-41f9-9a35-fd263f187762")
-	)
-	(wire
-		(pts
 			(xy 172.72 111.76) (xy 172.72 124.46)
 		)
 		(stroke
@@ -2277,6 +2267,16 @@
 			(type default)
 		)
 		(uuid "39b290b2-b4fe-4cdd-88ad-95de4e9762d0")
+	)
+	(wire
+		(pts
+			(xy 168.91 55.88) (xy 175.26 55.88)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "41618c34-c7d7-4c2d-9c0c-1e5d81799f4c")
 	)
 	(wire
 		(pts
@@ -2400,6 +2400,16 @@
 	)
 	(wire
 		(pts
+			(xy 146.05 55.88) (xy 153.67 55.88)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "789528dc-4dd2-416a-94ef-58a2bb5448ed")
+	)
+	(wire
+		(pts
 			(xy 165.1 118.11) (xy 198.12 118.11)
 		)
 		(stroke
@@ -2460,16 +2470,6 @@
 	)
 	(wire
 		(pts
-			(xy 146.05 55.88) (xy 146.05 64.77)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "9e33e9e2-8c5a-4775-a79b-bcc062bfb65d")
-	)
-	(wire
-		(pts
 			(xy 165.1 106.68) (xy 165.1 124.46)
 		)
 		(stroke
@@ -2487,16 +2487,6 @@
 			(type default)
 		)
 		(uuid "a70074c0-45a6-4316-9b74-98c37a89243b")
-	)
-	(wire
-		(pts
-			(xy 146.05 55.88) (xy 153.67 55.88)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "a8cb154d-c232-4226-97bf-c66ba47f296e")
 	)
 	(wire
 		(pts
@@ -2557,6 +2547,16 @@
 			(type default)
 		)
 		(uuid "f59860e2-bf1d-4a63-8377-abc736c3be19")
+	)
+	(wire
+		(pts
+			(xy 146.05 55.88) (xy 146.05 64.77)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "f6a8fa1a-05a2-48a1-9741-43701381b05a")
 	)
 	(wire
 		(pts
@@ -3001,6 +3001,7 @@
 	(symbol
 		(lib_id "Converter_DCDC:R-78B5.0-2.0")
 		(at 161.29 55.88 0)
+		(mirror y)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -3008,7 +3009,6 @@
 		(on_board yes)
 		(in_pos_files yes)
 		(dnp no)
-		(fields_autoplaced yes)
 		(uuid "1545ef91-31f2-437e-a1fe-f6b60bce6769")
 		(property "Reference" "U1"
 			(at 161.29 49.53 0)
@@ -3020,7 +3020,7 @@
 				)
 			)
 		)
-		(property "Value" "R-78K5.0-2.0"
+		(property "Value" "R-78K5.0-2.0L"
 			(at 161.29 52.07 0)
 			(show_name no)
 			(do_not_autoplace no)
@@ -3030,8 +3030,8 @@
 				)
 			)
 		)
-		(property "Footprint" "Converter_DCDC:Converter_DCDC_RECOM_R-78HB-0.5L_THT"
-			(at 162.56 62.23 0)
+		(property "Footprint" "custom-footprints:Converter_DCDC_RECOM_R-78K-2.0L_THT"
+			(at 160.02 62.23 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
