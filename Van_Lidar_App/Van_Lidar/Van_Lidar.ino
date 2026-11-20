@@ -5,18 +5,18 @@
     rangefinder(s) and transmit those readings using the ESP-NOW protocol to an
     ESP32 receiver app.
 
-    The /setup page allows configuration of the Access Point, sensor calibration, and
-    firmware updates.  Default AP credentials are located in the LittleFS data folder at
-    /data/APconfig.json.  You can change these if you want, but the preferred method is to
-    change the AP credentials after firmware installation using the /setup page.
-    If you forget your AP credentials, you can recover the defaults by holding down
-    the boot button on the ESP32 for a 5 seconds during startup.
+    The /setup page allows configuration of the Access Point, WiFi network,
+    sensor calibration, and firmware updates.  The default AP name is VanLidar_nnnn,
+    where nnnn is the last four hex digits of the device's factory MAC address.
+    Change the AP credentials using /setup, or recover the defaults by holding the ESP32
+    BOOT button for 5 seconds during startup.
 
-    The WiFi channel setting on the setup.html status tab, and the Receiver MAC address
-    must match the WiFi channel and MAC address reported in the Van_Level app setup page.
-    If these values do not match, then the ESP-Now radio communication will fail.
+    Connect this device and Van_Level to the same 2.4 GHz access point so ESP-NOW follows
+    the router's channel automatically. The Receiver MAC address must match the STA MAC
+    reported in the Van_Level app setup page. Setup remains available through the SoftAP.
 
-   Over The Air updates are handled by ElegantOTA https://github.com/ayushsharma82/ElegantOTA.
+  Over The Air updates are handled by ElegantOTA
+  https://github.com/ayushsharma82/ElegantOTA.
 
     Firmware OTA updates:
       Firmware .bin files are created by selecting "Sketch>Export Compiled Binary"
@@ -29,11 +29,12 @@
         Press [Ctrl] + [Shift] + [P] to open the command palette.
         Select "Upload Little FS to Pico/ESP8266/ESP32".
       You'll get an error because there isn't any ESP32 board connected – don't worry,
-      it will still create a .bin file from the data folder.  In the debugging window you'll
-      see the .littlefs.bin file location.  Probably in "C:\Users\<username>\AppData\Local\Temp\".
+      it will still create a .bin file from the data folder.  In the debugging window
+      you'll see the .littlefs.bin file location.  Probably in
+      "C:\Users\<username>\AppData\Local\Temp\".
 
 *******************************************************************************************/
-const char* VERSION = "1.0.0a";
+const char* VERSION = "1.0.0b";
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -42,9 +43,11 @@ const char* VERSION = "1.0.0a";
 #include <Arduino_JSON.h>
 #include <Preferences.h>
 #include <ElegantOTA.h>
+#include <esp_mac.h>
 #include <esp_now.h>
+#include <esp_timer.h>
 
-#define DEBUG_SERIAL 1
+#define DEBUG_SERIAL 0
 #if DEBUG_SERIAL
   #define DBG_PRINT(...) Serial.print(__VA_ARGS__)
   #define DBG_PRINTLN(...) Serial.println(__VA_ARGS__)
@@ -58,14 +61,21 @@ const char* VERSION = "1.0.0a";
 // Comment out to show plain text passwords in serial monitor
 #define HIDE_PASSWORDS
 
-// SoftAP configuration
-const char * s_configFile = "/APconfig.json"; // SoftAP configuration defaults
+// SoftAP and STA configuration
+constexpr char DEFAULT_AP_PASSWORD[] = "12345678";
+constexpr char DEFAULT_AP_IP[] = "192.168.4.1";
 String esid;
 String epass;
 String password;
 String myIP;
+String localIP = "Not Connected";
+String wsid;
+String wpass;
+String wifiStatusText = "Starting up";
+const unsigned long staRetryInterval = 10000;
+unsigned long lastStaRetryAttempt = 0;
+volatile bool wifiApplyPending = false;
 bool apConnected = false;
-JSONVar configJSON;
 
 // EEPROM storage for configuration values
 Preferences preferences;
@@ -109,7 +119,10 @@ typedef struct {
   uint8_t id;
   uint8_t units;    // DistanceUnits
   int16_t distance; // tenths of the selected unit (e.g. 1234 = 123.4)
+  float obstacleThresholdMm; // Only used by ultrasonic sensor 1; zero for Lidar
 } EspNowMessage;
+
+static_assert(sizeof(EspNowMessage) == 8, "Unexpected ESP-NOW packet layout");
 
 const char* DISTANCE_UNIT_NAMES[] = {"cm", "in", "m", "ft"};
 const float MILLIMETERS_PER_UNIT[] = {10.0f, 25.4f, 1000.0f, 304.8f};
@@ -118,12 +131,27 @@ uint8_t distanceUnits = UNITS_M;
 uint8_t receiverMacAddress[6] = {0, 0, 0, 0, 0, 0};
 String receiverMacStr = "";
 
-// WiFi channel for the SoftAP and ESP-NOW; receiver must be on the same channel
-const uint8_t WIFI_CHANNEL_MIN = 1;
-const uint8_t WIFI_CHANNEL_MAX = 13;
-uint8_t wifiChannel = 1;
 volatile bool lastSendSuccess = false;
 unsigned long lastSendTime = 0;
+
+struct SuccessfulReading {
+  float distance = 0.0f;
+  uint8_t units = UNITS_M;
+  int64_t receivedAt = 0;
+  bool received = false;
+};
+
+portMUX_TYPE readingsMutex = portMUX_INITIALIZER_UNLOCKED;
+
+struct EspNowSendState {
+  bool attempted = false;
+  bool success = false;
+  bool succeeded = false;
+  int64_t succeededAt = 0;
+};
+
+EspNowSendState sendStates[SENSOR_COUNT];
+int8_t pendingSendSensor = -1;
 
 // Latest sensor reading for each Lidar sensor
 struct LidarSensorState {
@@ -131,6 +159,7 @@ struct LidarSensorState {
   size_t frameLength = 0;
   float latestDistance = -1.0f;
   unsigned long lastReceivedAt = 0;
+  SuccessfulReading lastSuccessfulReading;
 };
 
 LidarSensorState lidarSensors[SENSOR_COUNT];
@@ -170,6 +199,16 @@ bool updateSensorData(HardwareSerial &serial, LidarSensorState &sensor) {
         : strength < 60 || strength == 65535 || distance > LIDAR_CLEAR_CM
           ? -1.0f : distance * 10.0f;
       sensor.lastReceivedAt = millis();
+      if (sensor.latestDistance >= 0) {
+        float offset = distance == LIDAR_CLEAR_CM ? 0.0f : distanceOffset;
+        portENTER_CRITICAL(&readingsMutex);
+        sensor.lastSuccessfulReading.distance = roundf((sensor.latestDistance
+            / MILLIMETERS_PER_UNIT[distanceUnits] + offset) * 10.0f) / 10.0f;
+        sensor.lastSuccessfulReading.units = distanceUnits;
+        sensor.lastSuccessfulReading.receivedAt = esp_timer_get_time();
+        sensor.lastSuccessfulReading.received = true;
+        portEXIT_CRITICAL(&readingsMutex);
+      }
       received = true;
       sensor.frameLength = 0;
     } else {
@@ -182,7 +221,7 @@ bool updateSensorData(HardwareSerial &serial, LidarSensorState &sensor) {
 
 // Construct an ESP-NOW message containing the latest distance reading for the given sensor
 EspNowMessage getDistanceMessage(uint8_t sensorId, const LidarSensorState &sensor) {
-  EspNowMessage message;
+  EspNowMessage message = {};
   message.id = sensorId;
   message.units = distanceUnits;
   message.distance = -1;
@@ -214,16 +253,46 @@ bool parseStrictFloat(const String &s, float &out) {
   return true;
 }
 
-// True only if the whole string is a valid WiFi channel number
-bool parseWifiChannel(const String &s, uint8_t &out) {
-  String t = s;
-  t.trim();
-  if (t.length() == 0) return false;
-  char *end;
-  long v = strtol(t.c_str(), &end, 10);
-  if (*end != '\0' || v < WIFI_CHANNEL_MIN || v > WIFI_CHANNEL_MAX) return false;
-  out = (uint8_t)v;
-  return true;
+bool hasValidSavedWifiCredentials() {
+  return wsid.length() > 0 && wsid != "Not Given" && wpass.length() >= 8;
+}
+
+void startStaConnect() {
+  WiFi.begin(wsid.c_str(), wpass.c_str());
+  lastStaRetryAttempt = millis();
+}
+
+void retryWifiStaConnection() {
+  if (!hasValidSavedWifiCredentials() || WiFi.status() == WL_CONNECTED) return;
+  if (WiFi.scanComplete() == WIFI_SCAN_RUNNING) return;
+  if (millis() - lastStaRetryAttempt >= staRetryInterval) {
+    wifiStatusText = "AP only - searching for saved WiFi";
+    startStaConnect();
+  }
+}
+
+void applyWifiSettings() {
+  WiFi.disconnect(false);
+  wsid = preferences.getString("WIFI_SSID", "");
+  wpass = preferences.getString("WIFI_PASS", "");
+  localIP = "Not Connected";
+  if (preferences.getString("WIFI_MODE", "") == "static") {
+    IPAddress address, gateway, subnet, primaryDNS, secondaryDNS;
+    address.fromString(preferences.getString("WIFI_IP", ""));
+    gateway.fromString(preferences.getString("WIFI_GATE", ""));
+    subnet.fromString(preferences.getString("WIFI_MASK", ""));
+    primaryDNS.fromString(preferences.getString("WIFI_PDNS", ""));
+    secondaryDNS.fromString(preferences.getString("WIFI_SDNS", ""));
+    WiFi.config(address, gateway, subnet, primaryDNS, secondaryDNS);
+  } else {
+    WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));
+  }
+  if (hasValidSavedWifiCredentials()) {
+    wifiStatusText = "Connecting to saved WiFi";
+    startStaConnect();
+  } else {
+    wifiStatusText = "AP only - no WiFi configured";
+  }
 }
 
 // Reads a request parameter without dereferencing a missing one
@@ -236,11 +305,30 @@ bool getParamStr(AsyncWebServerRequest *request, const char *name, bool post, St
 // Setup and configuration endpoints use the AP credentials
 #define REQUIRE_AUTH(req) if (!(req)->authenticate(esid.c_str(), epass.c_str())) return (req)->requestAuthentication()
 
+void completeEspNowSend(bool success) {
+  portENTER_CRITICAL(&readingsMutex);
+  if (pendingSendSensor < 0) {
+    portEXIT_CRITICAL(&readingsMutex);
+    return;
+  }
+  EspNowSendState &send = sendStates[pendingSendSensor];
+  send.attempted = true;
+  send.success = success;
+  if (success) {
+    send.succeeded = true;
+    send.succeededAt = esp_timer_get_time();
+  }
+  pendingSendSensor = -1;
+  lastSendSuccess = success;
+  lastSendTime = millis();
+  portEXIT_CRITICAL(&readingsMutex);
+}
+
 // ESP-NOW send status callback
 void onEspNowSend(const wifi_tx_info_t *info, esp_now_send_status_t status) {
-  lastSendSuccess = (status == ESP_NOW_SEND_SUCCESS);
-  lastSendTime = millis();
-  if (lastSendSuccess) {
+  bool success = status == ESP_NOW_SEND_SUCCESS;
+  completeEspNowSend(success);
+  if (success) {
     DBG_PRINTLN("ESP-NOW: Send successful");
   } else {
     DBG_PRINTLN("ESP-NOW: Send failed");
@@ -267,7 +355,6 @@ bool parseMacAddress(const String &macStr, uint8_t *mac) {
 
 // Initialize ESP-NOW
 void initEspNow() {
-  WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);  // energy saving causes problems with ESP-Now messages
   
   if (esp_now_init() != ESP_OK) {
@@ -308,6 +395,15 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       apConnected = true;
       DBG_PRINTLN("SoftAP client connected");
       break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      localIP = WiFi.localIP().toString();
+      wifiStatusText = "Connected to saved WiFi";
+      Serial.printf("Connected to saved WiFi at %s on channel: %ld\n", localIP.c_str(), static_cast<long>(WiFi.channel()));
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      localIP = "Not Connected";
+      if (hasValidSavedWifiCredentials()) wifiStatusText = "AP only - searching for saved WiFi";
+      break;
     default:
       break;
   }
@@ -333,29 +429,6 @@ void setup() {
     while (1);
   }
   DBG_PRINTLN("LittleFS successfully mounted");
-
-  // get default SoftAP configuration from file
-  File dataFile = LittleFS.open(s_configFile, FILE_READ); //Open File for reading
-  if (!dataFile) {
-    Serial.println("Config file open failed on read: Halting");
-    while (1);
-  } else {
-    String configContents;
-    DBG_PRINTLN("Reading configuration data from file:");
-    if (dataFile.available()) configContents = dataFile.readString();
-    dataFile.close();
-    #ifdef HIDE_PASSWORDS
-      DBG_PRINTLN( "*Hidden*");
-    #else
-      DBG_PRINTLN(configContents);
-    #endif
-
-    configJSON = JSON.parse(configContents);
-    if (JSON.typeof(configJSON) == "undefined") {
-      Serial.println("Parsing configuration file data failed: Halting");
-      while (1);
-    }
-  }
 
   // reset board to defaults if necessary (i.e. lost AP password)
   //  click EN/RESET button, then press and hold BOOT/GPIO0 button for 5 seconds
@@ -389,29 +462,20 @@ void setup() {
     DBG_PRINTLN("No receiver MAC configured yet");
   }
 
-  // retrieve EEPROM WiFi channel, falling back to default if out of range
-  wifiChannel = preferences.getUChar("wifiChannel", wifiChannel);
-  if (wifiChannel < WIFI_CHANNEL_MIN || wifiChannel > WIFI_CHANNEL_MAX) wifiChannel = 1;
-  DBG_PRINT("WiFi Channel: ");
-  DBG_PRINTLN(wifiChannel);
-
-  // retrieve EEPROM AP configuration
+  // Use saved AP settings when present
   esid = preferences.getString("AP_SSID", "");
-  epass = preferences.getString("AP_PASS", "");
-  String eap = preferences.getString("AP_IP", "");
-
-  // if EEPROM info is missing, use defaults from config file
-  if ((esid == "") && (epass == "")) {
-    DBG_PRINTLN("\nInitial SoftAP user/pass configuration");
-    esid = String(configJSON["AP_name"]);
-    epass = String(configJSON["AP_pass"]);
-    preferences.putString("AP_SSID", esid);
-    preferences.putString("AP_PASS", epass);
-  }
-  if (eap == "") {
-    DBG_PRINTLN("\nInitial SoftAP address configuration");
-    eap = String(configJSON["AP_IP"]);
-    preferences.putString("AP_IP", eap);
+  epass = preferences.getString("AP_PASS", DEFAULT_AP_PASSWORD);
+  String eap = preferences.getString("AP_IP", DEFAULT_AP_IP);
+  if (esid.isEmpty()) {
+    uint8_t mac[6];
+    if (esp_efuse_mac_get_default(mac) != ESP_OK) {
+      Serial.println("Failed to read factory MAC for default SoftAP SSID: Halting");
+      while (1);
+    }
+    char defaultSsid[sizeof("VanLidar_0000")];
+    snprintf(defaultSsid, sizeof(defaultSsid), "VanLidar_%02X%02X",
+             static_cast<unsigned>(mac[4]), static_cast<unsigned>(mac[5]));
+    esid = defaultSsid;
   }
 
   DBG_PRINT("Access point SSID: ");
@@ -427,9 +491,9 @@ void setup() {
 
   // start our SoftAP with one allowed connection
   WiFi.onEvent(WiFiEvent);
-  WiFi.mode(WIFI_AP);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAPsetHostname(esid.c_str());
-  if (!WiFi.softAP(esid.c_str(), epass.c_str(), wifiChannel, 0, 1))
+  if (!WiFi.softAP(esid.c_str(), epass.c_str(), 1, 0, 1))
   {
     Serial.println("SoftAP creation failed: Halting");
     while (1);
@@ -454,7 +518,47 @@ void setup() {
   });
 
   server.on("/", WebRequestMethod::HTTP_GET, [](AsyncWebServerRequest * request) {
-    request -> redirect("/setup");
+    if (LittleFS.exists("/index.html")) request -> send(LittleFS, "/index.html", "text/html");
+    else request -> redirect("/setup");
+  });
+
+  server.on("/index.html", WebRequestMethod::HTTP_GET, [](AsyncWebServerRequest * request) {
+    if (LittleFS.exists("/index.html")) request -> send(LittleFS, "/index.html", "text/html");
+    else request -> redirect("/setup");
+  });
+
+  server.on("/readings", WebRequestMethod::HTTP_GET, [](AsyncWebServerRequest * request) {
+    SuccessfulReading readings[SENSOR_COUNT];
+    EspNowSendState sends[SENSOR_COUNT];
+    portENTER_CRITICAL(&readingsMutex);
+    int8_t pending = pendingSendSensor;
+    for (size_t index = 0; index < SENSOR_COUNT; ++index) {
+      readings[index] = lidarSensors[index].lastSuccessfulReading;
+      sends[index] = sendStates[index];
+    }
+    portEXIT_CRITICAL(&readingsMutex);
+    JSONVar data = JSON.parse("[]");
+    for (size_t index = 0; index < SENSOR_COUNT; ++index) {
+      JSONVar item;
+      item["id"] = SENSOR_IDS[index];
+      item["received"] = readings[index].received;
+      item["send_status"] = receiverMacStr.length() == 0 ? "Not configured"
+          : sends[index].attempted ? (sends[index].success ? "Success" : "Failed")
+          : pending == (int8_t)index ? "Sending" : "Not sent";
+      item["send_succeeded"] = sends[index].succeeded;
+      if (sends[index].succeeded) {
+        item["send_age_ms"] = (double)(esp_timer_get_time() - sends[index].succeededAt) / 1000.0;
+      }
+      if (readings[index].received) {
+        item["value"] = readings[index].distance;
+        item["units"] = DISTANCE_UNIT_NAMES[readings[index].units];
+        item["age_ms"] = (double)(esp_timer_get_time() - readings[index].receivedAt) / 1000.0;
+      }
+      data[(int)index] = item;
+    }
+    AsyncWebServerResponse *response = request->beginResponse(200, "application/json", JSON.stringify(data));
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
   });
 
   server.on("/setup", WebRequestMethod::HTTP_GET, [](AsyncWebServerRequest * request) {
@@ -473,16 +577,79 @@ void setup() {
   server.on("/setupData", WebRequestMethod::HTTP_GET, [](AsyncWebServerRequest * request) {
     REQUIRE_AUTH(request);
     JSONVar data;
-    data["default_pass"] = (epass == String(configJSON["AP_pass"]));
+    data["default_pass"] = (epass == DEFAULT_AP_PASSWORD);
     data["ver"] = String(VERSION);
     data["myIP"] = myIP;
     data["apname"] = esid;
     data["distance_offset"] = String(distanceOffset, 6);
     data["units"] = DISTANCE_UNIT_NAMES[distanceUnits];
     data["receiver_mac"] = receiverMacStr;
-    data["wifi_channel"] = (int)preferences.getUChar("wifiChannel", wifiChannel);
+    data["wifi_channel"] = WiFi.channel();
+    data["wifi_state"] = wifiStatusText;
+    data["localIP"] = localIP;
+    data["wsid"] = wsid;
     data["MAC"] = WiFi.softAPmacAddress();
     request -> send(200, "application/json", JSON.stringify(data));
+  });
+
+  server.on("/scanWifi", WebRequestMethod::HTTP_GET, [](AsyncWebServerRequest * request) {
+    REQUIRE_AUTH(request);
+    int count = WiFi.scanComplete();
+    if (count == WIFI_SCAN_FAILED) {
+      WiFi.scanNetworks(true);
+      request -> send(202, "application/json", "{\"scanning\":true}");
+      return;
+    }
+    if (count == WIFI_SCAN_RUNNING) {
+      request -> send(202, "application/json", "{\"scanning\":true}");
+      return;
+    }
+    JSONVar list = JSON.parse("[]");
+    for (int index = 0; index < count; ++index) {
+      JSONVar network;
+      network["rssi"] = WiFi.RSSI(index);
+      network["ssid"] = WiFi.SSID(index);
+      network["bssid"] = WiFi.BSSIDstr(index);
+      network["channel"] = WiFi.channel(index);
+      network["secure"] = (int)WiFi.encryptionType(index);
+      list[index] = network;
+    }
+    WiFi.scanDelete();
+    request -> send(200, "application/json", JSON.stringify(list));
+  });
+
+  server.on("/connectBtnFunction", WebRequestMethod::HTTP_POST, [](AsyncWebServerRequest * request) {
+    REQUIRE_AUTH(request);
+    String ssid, pass, mode;
+    if (!getParamStr(request, "wifi_ssid", true, ssid) || !getParamStr(request, "wifi_pass", true, pass)
+        || !getParamStr(request, "wifi_mode", true, mode)) {
+      request -> send(400, "text/plain", "missing parameter");
+      return;
+    }
+    if (ssid.length() == 0 || ssid.length() > 32 || pass.length() < 8 || pass.length() > 63
+        || (mode != "dhcp" && mode != "static")) {
+      request -> send(400, "text/plain", "Invalid SSID, WPA password (8-63 characters), or WiFi mode.");
+      return;
+    }
+    const char* parameters[] = {"txtipadd", "net_m", "g_add", "p_dns", "s_dns"};
+    const char* keys[] = {"WIFI_IP", "WIFI_MASK", "WIFI_GATE", "WIFI_PDNS", "WIFI_SDNS"};
+    String addresses[5];
+    if (mode == "static") {
+      for (size_t index = 0; index < 5; ++index) {
+        getParamStr(request, parameters[index], true, addresses[index]);
+        IPAddress address;
+        if ((index < 4 || addresses[index].length() > 0) && !address.fromString(addresses[index])) {
+          request -> send(400, "text/plain", "Invalid static network address.");
+          return;
+        }
+      }
+      for (size_t index = 0; index < 5; ++index) preferences.putString(keys[index], addresses[index]);
+    }
+    preferences.putString("WIFI_SSID", ssid);
+    preferences.putString("WIFI_PASS", pass);
+    preferences.putString("WIFI_MODE", mode);
+    wifiApplyPending = true;
+    request -> send(200, "text/plain", "ok");
   });
 
   server.on("/espNowStatus", WebRequestMethod::HTTP_GET, [](AsyncWebServerRequest * request) {
@@ -498,20 +665,12 @@ void setup() {
   server.on("/applyBtnFunction", WebRequestMethod::HTTP_POST, [](AsyncWebServerRequest * request) {
     REQUIRE_AUTH(request);
     DBG_PRINTLN( "Assigning AP");
-    String txtssid, txtpass, txtaplan, newChannelStr;
+    String txtssid, txtpass, txtaplan;
     if (!getParamStr(request, "txtssid", true, txtssid) || !getParamStr(request, "txtpass", true, txtpass)
-        || !getParamStr(request, "txtaplan", true, txtaplan) || !getParamStr(request, "wifi_channel", true, newChannelStr)) {
+      || !getParamStr(request, "txtaplan", true, txtaplan)) {
       request -> send(400, "text/plain", "missing parameter");
       return;
     }
-    uint8_t newChannel;
-    if (!parseWifiChannel(newChannelStr, newChannel)) {
-      request -> send(400, "text/plain", "WiFi channel must be a whole number from 1 to 13.");
-      return;
-    }
-    preferences.putUChar("wifiChannel", newChannel);
-    DBG_PRINT("Writing WiFi Channel :: ");
-    DBG_PRINTLN(newChannel);
     if (txtssid.length() > 0) {
       preferences.putString("AP_SSID", txtssid);
       DBG_PRINT("Writing AP SSID :: ");
@@ -640,11 +799,15 @@ void setup() {
     }
   });
 
-  // only these folders are public; APconfig.json and the HTML pages are not served from here
+  // Only serve the public asset folders here
   server.serveStatic("/images", LittleFS, "/images");
+  events.onConnect([](AsyncEventSourceClient * client) {
+    client -> send("hello!", NULL, millis(), 1000);
+  });
+  server.addHandler(&events);
   
-  // setup our WiFi for AP mode only
-  WiFi.mode(WIFI_AP);
+  WiFi.setAutoReconnect(true);
+  applyWifiSettings();
 
   server.begin(); // start the webserver for the Access Point and Station
   
@@ -658,6 +821,12 @@ void setup() {
 void loop() {
   ElegantOTA.loop();
   
+  if (wifiApplyPending) {
+    wifiApplyPending = false;
+    applyWifiSettings();
+  }
+  retryWifiStaConnection();
+  
   if (bootStart != 0) {
     // received a reboot request from the setup page
     if ((millis() - bootStart) > bootDelay) {
@@ -668,14 +837,21 @@ void loop() {
   updateSensorData(Serial1, lidarSensors[0]);
   updateSensorData(Serial2, lidarSensors[1]);
   
-  if ((millis() - lastPushTime) >= ESPDelay / SENSOR_COUNT) {
+  portENTER_CRITICAL(&readingsMutex);
+  bool pending = pendingSendSensor >= 0;
+  portEXIT_CRITICAL(&readingsMutex);
+  if (!pending && (millis() - lastPushTime) >= ESPDelay / SENSOR_COUNT) {
     lastPushTime = millis();
     
     if (receiverMacStr.length() > 0) {
       EspNowMessage msg = getDistanceMessage(SENSOR_IDS[nextSensor], lidarSensors[nextSensor]);
       
+      portENTER_CRITICAL(&readingsMutex);
+      pendingSendSensor = nextSensor;
+      portEXIT_CRITICAL(&readingsMutex);
       esp_err_t result = esp_now_send(receiverMacAddress, (uint8_t *)&msg, sizeof(msg));
       if (result != ESP_OK) {
+        completeEspNowSend(false);
         DBG_PRINTF("ESP-NOW sensor %u send failed: %s (0x%X)\n", msg.id, esp_err_to_name(result), (unsigned int)result);
       } else {
         DBG_PRINTF("ESP_NOW sensor %u: ", msg.id);
